@@ -199,6 +199,180 @@ def run():
             str(outs[:2]),
         )
 
+        # ---- 11. 引用页：用已公开记录拼口径 ----
+        pubs = client.get("/api/public").json()["publications"]
+        ids = [p["id"] for p in pubs]
+        check("引用测试前提：恰有 2 条公开记录", len(pubs) == 2, str(pubs))
+
+        # 11a. 两个范围各自可拼，且整份报告只需这 2 个编号。
+        body = {
+            "publication_ids": ids,
+            "ranges": [
+                {"districts": ["城东"], "age_groups": ["青年", "老年"]},
+                {"districts": ["城东", "城西"], "age_groups": ["青年"]},
+            ],
+        }
+        r = client.post("/api/citation", json=body)
+        j = r.json()
+        check("引用页生成成功", r.status_code == 201, r.text)
+        check("整份报告用到 2 个不同发布编号",
+              j.get("publication_count") == 2, r.text)
+        check("范围 1 只用 #%d 一项，总数=10" % ids[0],
+              j["ranges"][0]["terms"] == [{"publication_id": ids[0], "coefficient": 1}]
+              and j["ranges"][0]["total"] == 10, str(j.get("ranges")))
+        check("范围 2 共用两条出处，总数=10",
+              [(t["publication_id"], t["coefficient"]) for t in j["ranges"][1]["terms"]]
+              == [(ids[1], 1)]
+              and j["ranges"][1]["total"] == 10, str(j.get("ranges")))
+        token = j.get("token")
+        check("返回可重新打开的引用页地址",
+              isinstance(token, str) and j.get("url") == f"/cite/{token}", r.text)
+
+        # 11b. 引用页数据：列出算式、发布编号、总数。
+        r = client.get(f"/api/citation/{token}")
+        j2 = r.json()
+        check("引用页可按地址重新打开", r.status_code == 200, r.text)
+        check("引用页复算核对通过", j2["verification"]["ok"], r.text)
+        check("引用页快照列出各范围算式与总数",
+              len(j2["snapshot"]["ranges"]) == 2
+              and j2["snapshot"]["ranges"][1]["total"] == 10
+              and j2["snapshot"]["ranges"][0]["terms"], r.text)
+        check("引用页快照列出所用发布编号",
+              [p["id"] for p in j2["snapshot"]["publications"]] == ids, r.text)
+        r = client.get(f"/cite/{token}")
+        check("引用页 HTML 可访问", r.status_code == 200 and "引用页" in r.text, r.text)
+
+        # 11c. 新增发布后，旧引用页仍按原编号和原算式复算。
+        new_pub = dbmod.insert_publication(["城东", "城西"], ["老年"], 16)
+        r = client.get(f"/api/citation/{token}")
+        j3 = r.json()
+        check("新增发布后旧引用页仍可打开且复算通过",
+              r.status_code == 200 and j3["verification"]["ok"], r.text)
+        check("旧引用页快照编号未被新增发布改写",
+              [p["id"] for p in j3["snapshot"]["publications"]] == ids, r.text)
+        check("旧引用页仍按原算式给出原总数",
+              j3["snapshot"]["ranges"] == j2["snapshot"]["ranges"], r.text)
+
+        # 11d. 有范围拼不出：逐项指出，且整份不生成引用页。
+        bad = {
+            "publication_ids": ids,
+            "ranges": [
+                {"districts": ["城东"], "age_groups": ["青年"]},          # 拼不出
+                {"districts": ["城东"], "age_groups": ["青年", "老年"]},  # 可拼
+            ],
+        }
+        before = len(client.get("/api/public").json()["publications"])
+        r = client.post("/api/citation", json=bad)
+        d = r.json().get("detail", {})
+        check("有范围拼不出时返回 422 且不生成引用页",
+              r.status_code == 422 and "token" not in r.json(), r.text)
+        conn = sqlite3.connect(os.environ["DB_PATH"])
+        n_reports = conn.execute("SELECT COUNT(*) FROM citation_reports").fetchone()[0]
+        conn.close()
+        check("拼不出时引用页未落库", n_reports == 1, f"reports={n_reports}")
+        check("逐项标明拼不出的范围（第 1 个）",
+              d.get("ranges", [{}])[0].get("feasible") is False
+              and d["ranges"][0]["reasons"], r.text)
+        check("同一响应中可拼的范围标为可行",
+              d.get("ranges", [{}, {}])[1].get("feasible") is True, r.text)
+        check("拼不出时目标格仍给出覆盖来源",
+              d["ranges"][0]["coverage"]
+              and d["ranges"][0]["coverage"][0]["publication_ids"] == ids, r.text)
+
+        # 11e. 请求校验：编号范围、重复范围、未知编号、未知分区。
+        r = client.post("/api/citation", json={"publication_ids": [], "ranges": body["ranges"]})
+        check("未勾选发布记录被拒绝", r.status_code == 400, r.text)
+        r = client.post("/api/citation", json={
+            "publication_ids": ids, "ranges": body["ranges"] * 2})
+        check("范围重复被拒绝", r.status_code == 400, r.text)
+        r = client.post("/api/citation", json={
+            "publication_ids": [999], "ranges": body["ranges"][:1]})
+        check("未知发布编号被拒绝", r.status_code == 400, r.text)
+        r = client.post("/api/citation", json={
+            "publication_ids": ids,
+            "ranges": [{"districts": ["不存在"], "age_groups": ["青年"]}]})
+        check("引用请求中的未知分区被拒绝", r.status_code == 400, r.text)
+        r = client.post("/api/citation", json={
+            "publication_ids": ids,
+            "ranges": [{"districts": [], "age_groups": ["青年"]}]})
+        check("引用范围为空的交集被拒绝", r.status_code == 400, r.text)
+        r = client.get("/api/citation/no-such-token")
+        check("不存在的引用页返回 404", r.status_code == 404, r.text)
+
+        # 11f. 最少不同编号：若允许 3 条记录，报告仍只选最少的 2 条。
+        r = client.post("/api/citation", json=body)
+        check("加入更多可选记录时仍给出最少编号方案",
+              r.status_code == 201 and r.json()["publication_count"] == 2, r.text)
+
+    # ---- 12. 引用算式单元级：加减、至多一次、编号最少、上限 ----
+    from app.cite import CitationError, plan_report
+
+    cells = [
+        {"district": d, "age_group": a, "population": 20, "detected": 5}
+        for d in ["东", "西"] for a in ["青", "老"]
+    ]
+
+    def pub(pid, ds, ags, total):
+        return {"id": pid, "districts": ds, "age_groups": ags,
+                "total": total, "created_at": "2026-01-01T00:00:00+00:00"}
+
+    pubs = [
+        pub(1, ["东", "西"], ["青", "老"], 30),   # 全表
+        pub(2, ["西"], ["青", "老"], 12),         # 西半表
+        pub(3, ["东"], ["青"], 9),                # 东青单格
+    ]
+
+    r = plan_report(cells, pubs, [1, 2, 3],
+                    [{"districts": ["东"], "age_groups": ["青", "老"]}])
+    check("减法可拼：东×青老 = #1 − #2 = 18",
+          r["feasible"]
+          and r["ranges"][0]["terms"]
+          == [{"publication_id": 1, "coefficient": 1},
+              {"publication_id": 2, "coefficient": -1}]
+          and r["ranges"][0]["total"] == 18, str(r))
+
+    r = plan_report(cells, pubs, [1, 2, 3],
+                    [{"districts": ["东"], "age_groups": ["青"]}])
+    check("编号最少：东×青 优先用 1 条记录 #3（而非 2 条）",
+          r["feasible"] and len(r["ranges"][0]["terms"]) == 1
+          and r["ranges"][0]["terms"][0]["publication_id"] == 3
+          and r["publication_count"] == 1, str(r))
+
+    r = plan_report(cells, pubs, [1, 2],
+                    [{"districts": ["东"], "age_groups": ["青"]}])
+    check("同一记录至多一次：需重复 #1 的方案不可行",
+          not r["feasible"] and r["ranges"][0]["reasons"], str(r))
+
+    r = plan_report(cells, [pub(4, ["东"], ["青", "老"], 20)], [4],
+                    [{"districts": ["东"], "age_groups": ["青"]}])
+    check("范围外目标格净计必须为 0：东×青 无法排除 东×老",
+          not r["feasible"], str(r))
+
+    r = plan_report(cells, pubs, [1, 2, 3],
+                    [{"districts": ["东"], "age_groups": ["青", "老"]},
+                     {"districts": ["西"], "age_groups": ["青", "老"]}])
+    check("多个算式可共用出处并各自正确",
+          r["feasible"]
+          and [x["total"] for x in r["ranges"]] == [18, 12]
+          and r["publication_count"] == 2, str(r))
+
+    was = None
+    try:
+        plan_report(cells, pubs, [1, 2, 3],
+                    [{"districts": ["东"], "age_groups": ["青"]}] * 4)
+    except CitationError as e:
+        was = str(e)
+    check("范围数超过 3 被拒绝", was is not None, str(was))
+
+    too_many = [pub(i, ["东"], ["青"], 9) for i in range(1, 22)]
+    was = None
+    try:
+        plan_report(cells, too_many, list(range(1, 22)),
+                    [{"districts": ["东"], "age_groups": ["青"]}])
+    except CitationError as e:
+        was = str(e)
+    check("发布记录超过 20 条被拒绝", was is not None, str(was))
+
 
 run()
 print(f"\n{sum(results)}/{len(results)} 通过")

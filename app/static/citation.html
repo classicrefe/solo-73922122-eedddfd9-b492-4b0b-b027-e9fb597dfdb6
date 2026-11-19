@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>引用页 · 汇总口径算式</title>
+<style>
+  body{font-family:system-ui,"PingFang SC","Microsoft YaHei",sans-serif;margin:0;background:#f4f6f8;color:#222}
+  header{background:#2e6b4f;color:#fff;padding:14px 24px}
+  header h1{margin:0;font-size:20px}
+  main{max-width:960px;margin:20px auto;padding:0 16px}
+  section{background:#fff;border-radius:8px;padding:16px 20px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,.08)}
+  h2{font-size:16px;margin:0 0 12px}
+  table{border-collapse:collapse;margin-top:8px}
+  th,td{border:1px solid #dde3ea;padding:6px 12px;font-size:14px;text-align:center}
+  th{background:#eef2f6}
+  .hint{font-size:13px;color:#667}
+  .formula{font-family:ui-monospace,Consolas,monospace;font-size:15px;background:#f7f9fb;border:1px solid #e2e8ef;border-radius:6px;padding:10px 12px;margin:8px 0;white-space:pre-wrap}
+  .total{font-weight:700}
+  .msg{padding:10px 12px;border-radius:6px;font-size:14px;white-space:pre-wrap}
+  .msg.ok{background:#e6f6e8;border:1px solid #9ed3a7}
+  .msg.err{background:#fdecea;border:1px solid #f2b8b0}
+  a{color:#1d5c8f}
+  @media print{ body{background:#fff} section{box-shadow:none;border:1px solid #ccc} header{background:#fff;color:#000} }
+</style>
+</head>
+<body>
+<header><h1>引用页 · 汇总口径算式</h1></header>
+<main>
+  <section>
+    <h2>说明</h2>
+    <p class="hint">
+      本页把已公开的检出总数拼成报告所需口径。每条算式只对公开记录的总数做加减，
+      同一记录在一条算式中至多出现一次；按公开人数表核对，范围内每个调查格净计 1 次，
+      范围外每个调查格净计 0 次。可据此按出处逐条复算。
+    </p>
+    <div id="meta" class="hint">加载中…</div>
+    <div id="verify"></div>
+  </section>
+  <section>
+    <h2>各范围的算式与总数</h2>
+    <div id="ranges">加载中…</div>
+  </section>
+  <section>
+    <h2>用到的发布编号</h2>
+    <div id="pubs">加载中…</div>
+  </section>
+  <p class="hint"><a href="/public">← 返回公开数据页</a></p>
+</main>
+<script>
+function esc(s){return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+
+function termText(t, byId){
+  const sign = t.coefficient < 0 ? '−' : '+';
+  const pub = byId[t.publication_id];
+  const detail = pub ? `（${esc(pub.districts.join('、'))} / ${esc(pub.age_groups.join('、'))}）` : '';
+  return `${sign} #${t.publication_id} = ${pub ? pub.total : '?'} ${detail}`;
+}
+
+async function load(){
+  const token = decodeURIComponent(location.pathname.split('/').filter(Boolean).pop() || '');
+  let r;
+  try{
+    r = await fetch('/api/citation/' + encodeURIComponent(token));
+  }catch(e){
+    document.getElementById('meta').textContent = '加载失败';
+    return;
+  }
+  if(!r.ok){
+    document.getElementById('meta').textContent = '引用页不存在或已被删除。';
+    for(const id of ['ranges','pubs']) document.getElementById(id).textContent = '';
+    return;
+  }
+  const body = await r.json();
+  const snap = body.snapshot;
+  const byId = {};
+  for(const p of snap.publications) byId[p.id] = p;
+
+  document.getElementById('meta').textContent =
+    `生成时间：${snap.generated_at}（UTC）　共 ${snap.ranges.length} 个范围，`
+    + `用到 ${snap.publications.length} 个不同发布编号`;
+
+  const v = body.verification;
+  const vel = document.getElementById('verify');
+  if(v && v.ok){
+    vel.className = 'msg ok';
+    vel.textContent = '复算核对：按原发布编号与原算式复算，与各范围记录的总数一致；'
+      + '范围内每格净计 1 次、范围外每格净计 0 次。';
+  }else{
+    vel.className = 'msg err';
+    vel.textContent = '复算核对未通过：\n' + ((v && v.problems) || ['未知错误']).join('\n');
+  }
+
+  let h = '';
+  snap.ranges.forEach((rg, idx) => {
+    const terms = rg.terms || [];
+    const formula = terms.length
+      ? terms.map(t => termText(t, byId)).join('\n') + `\n= ${rg.total}`
+      : `= ${rg.total}`;
+    h += `<div class="formula"><b>范围 ${idx + 1}：${esc(rg.label)}</b>\n`
+      + `${esc(formula)}\n`
+      + `<span class="total">总数：${rg.total}</span>`
+      + `<span class="hint">　覆盖调查格 ${rg.target_cells} 个，人数合计 ${rg.population_total}</span>`
+      + `</div>`;
+  });
+  document.getElementById('ranges').innerHTML = h || '<p class="hint">无</p>';
+
+  document.getElementById('pubs').innerHTML = snap.publications.length
+    ? '<table><tr><th>发布编号</th><th>分区</th><th>年龄组</th><th>公开总数</th><th>发布时间 (UTC)</th></tr>'
+      + snap.publications.map(p => `<tr><td>#${p.id}</td><td>${esc(p.districts.join('、'))}</td>`
+        + `<td>${esc(p.age_groups.join('、'))}</td><td>${p.total}</td><td>${esc(p.created_at)}</td></tr>`).join('')
+      + '</table>'
+    : '<p class="hint">无</p>';
+}
+load();
+</script>
+</body>
+</html>

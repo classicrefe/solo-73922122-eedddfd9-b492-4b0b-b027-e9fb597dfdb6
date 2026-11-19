@@ -2,6 +2,8 @@
 
 - cells：导入的调查格值（导入后不可更换，无更新/删除接口）。
 - publications：已获准公开的汇总记录（不可撤销，只插入，无更新/删除接口）。
+- citation_reports：生成的引用页快照（发布编号 + 算式 + 生成时总数），
+  按不可变快照保存，新增发布不影响已有引用页。
 
 所有写操作均在单事务中完成：失败即整体回滚，不会留下半次发布。
 连接按操作创建，启用 WAL，重启后数据保留在 DB_PATH 指定的库文件中。
@@ -31,6 +33,11 @@ CREATE TABLE IF NOT EXISTS publications (
     age_groups TEXT NOT NULL,          -- JSON 数组
     total      INTEGER NOT NULL CHECK (total >= 0),
     created_at TEXT NOT NULL           -- ISO8601 UTC
+);
+CREATE TABLE IF NOT EXISTS citation_reports (
+    token      TEXT PRIMARY KEY,       -- 公开引用页标识
+    snapshot   TEXT NOT NULL,          -- JSON：发布编号、系数、生成时总数
+    created_at TEXT NOT NULL
 );
 """
 
@@ -106,3 +113,28 @@ def insert_publication(districts: list[str], age_groups: list[str], total: int) 
         "total": int(total),
         "created_at": created,
     }
+
+
+def insert_citation_report(token: str, snapshot: dict) -> dict:
+    """单事务保存引用页快照；失败回滚，不留下半份报告。"""
+    created = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    payload = json.dumps(snapshot, ensure_ascii=False, sort_keys=True)
+    with closing(connect()) as conn, conn:
+        conn.execute(
+            "INSERT INTO citation_reports (token, snapshot, created_at) VALUES (?, ?, ?)",
+            (token, payload, created),
+        )
+    return {"token": token, "snapshot": snapshot, "created_at": created}
+
+
+def get_citation_report(token: str) -> dict | None:
+    with closing(connect()) as conn:
+        row = conn.execute(
+            "SELECT token, snapshot, created_at FROM citation_reports WHERE token = ?",
+            (token,),
+        ).fetchone()
+    if row is None:
+        return None
+    out = dict(row)
+    out["snapshot"] = json.loads(out["snapshot"])
+    return out

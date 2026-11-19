@@ -10,11 +10,15 @@
 - POST /api/preview    预览交集检出总数并做安全评估
 - POST /api/publish    确认发布（按最新公开记录重核后原子写入）
 - GET  /api/public     公开数据（人数 + 获准汇总）
+- POST /api/citation   用已公开记录拼出若干范围的算式；全部可拼才生成引用页
+- GET  /api/citation/{token} 按原编号与原算式复算引用页
+- GET  /cite/{token}   可重新打开的引用页
 """
 
 import asyncio
 import csv
 import io
+import secrets
 import sqlite3
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -23,11 +27,14 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 
+from .cite import CitationError, plan_report, verify_snapshot
 from .database import (
     get_cells,
+    get_citation_report,
     get_publications,
     init_db,
     insert_cells,
+    insert_citation_report,
     insert_publication,
 )
 from .solver import evaluate
@@ -124,6 +131,16 @@ class Selection(BaseModel):
     age_groups: list[str] = Field(default_factory=list)
 
 
+class CitationRange(BaseModel):
+    districts: list[str] = Field(default_factory=list)
+    age_groups: list[str] = Field(default_factory=list)
+
+
+class CitationRequest(BaseModel):
+    publication_ids: list[int] = Field(default_factory=list)
+    ranges: list[CitationRange] = Field(default_factory=list)
+
+
 # ---------------- 工具 ----------------
 
 
@@ -154,6 +171,11 @@ def index_page():
 @app.get("/public", include_in_schema=False)
 def public_page():
     return FileResponse(STATIC_DIR / "public.html")
+
+
+@app.get("/cite/{token}", include_in_schema=False)
+def citation_page(token: str):
+    return FileResponse(STATIC_DIR / "citation.html")
 
 
 @app.get("/sample_survey.csv", include_in_schema=False)
@@ -264,3 +286,49 @@ def public_data():
         ],
         "publications": get_publications(),
     }
+
+
+# ---------------- 引用页 ----------------
+
+
+@app.post("/api/citation", status_code=201)
+async def create_citation(req: CitationRequest):
+    """拼合引用算式。任一范围拼不出时不生成引用页，逐项返回原因。"""
+    cells = get_cells()
+    if not cells:
+        raise HTTPException(400, "尚未导入调查数据")
+    publications = get_publications()
+    try:
+        result = await asyncio.to_thread(
+            plan_report,
+            cells,
+            publications,
+            req.publication_ids,
+            [r.model_dump() for r in req.ranges],
+        )
+    except CitationError as e:
+        raise HTTPException(400, str(e))
+    if not result["feasible"]:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": "有范围无法用所选发布记录拼出，未生成引用页",
+                "ranges": result["ranges"],
+            },
+        )
+    token = secrets.token_urlsafe(12)
+    try:
+        saved = insert_citation_report(token, result["snapshot"])
+    except Exception:
+        raise HTTPException(500, "引用页保存失败，未生成任何引用页")
+    return {**result, "token": saved["token"], "created_at": saved["created_at"],
+            "url": f"/cite/{saved['token']}"}
+
+
+@app.get("/api/citation/{token}")
+def read_citation(token: str):
+    report = get_citation_report(token)
+    if report is None:
+        raise HTTPException(404, "引用页不存在")
+    check = verify_snapshot(get_cells(), get_publications(), report["snapshot"])
+    return {**report, "verification": check}
